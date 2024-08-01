@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import logging
 import sys
+import time
 from tkinter import messagebox
 
 import aiofiles
@@ -12,33 +13,50 @@ from authorization import authorize_user
 from utils import get_connection, read_message, write_message
 
 logger = logging.getLogger('listener')
+watchdog_logger = logging.getLogger('watchdog')
 
 
-async def read_msgs(host, port, message_queue, save_messages_queue):
+async def read_msgs(host, port, message_queue, save_messages_queue, status_updates_queue, watchdog_queue):
+    status_updates_queue.put_nowait(gui.ReadConnectionStateChanged.INITIATED)
     async with get_connection(host, port) as (reader, writer):
+        status_updates_queue.put_nowait(gui.ReadConnectionStateChanged.ESTABLISHED)
         try:
             while True:
                 message = await read_message(reader)
                 message_queue.put_nowait(message)
                 save_messages_queue.put_nowait(message)
+                watchdog_queue.put_nowait('New message in chat')
         except ConnectionError:
             logger.error('Connection Error')
+            status_updates_queue.put_nowait(gui.ReadConnectionStateChanged.CLOSED)
+        finally:
+            status_updates_queue.put_nowait(gui.ReadConnectionStateChanged.CLOSED)
 
 
 class InvalidToken(Exception):
     pass
 
 
-async def send_msgs(host, port, sending_queue, token, username):
+async def send_msgs(host, port, sending_queue, status_updates_queue, watchdog_queue, token, username):
+    status_updates_queue.put_nowait(gui.SendingConnectionStateChanged.INITIATED)
+    watchdog_queue.put_nowait('Prompt before auth')
     async with get_connection(host, port) as (reader, writer):
         account = await authorize_user(reader, writer, token, username)
         if not account:
+            status_updates_queue.put_nowait(gui.SendingConnectionStateChanged.CLOSED)
+            watchdog_queue.put_nowait('Auth failed')
             raise InvalidToken('Неверный токен')
         else:
-            logger.info(f'Пользователь {account.get("nickname")} успешно авторизован')
+            nickname = account.get('nickname')
+            logger.info(f'Пользователь {nickname} успешно авторизован')
+            watchdog_queue.put_nowait('Auth success')
+            status_updates_queue.put_nowait(gui.SendingConnectionStateChanged.ESTABLISHED)
+            status_updates_queue.put_nowait(gui.NicknameReceived(nickname))
+
         while True:
             message = await sending_queue.get()
             await write_message(writer, f'{message}\n\n')
+            watchdog_queue.put_nowait('Sent message')
 
 
 def parse_args():
@@ -80,23 +98,33 @@ async def save_messages(save_messages_queue, filename):
         save_messages_queue.task_done()
 
 
+async def watch_for_connection(watchdog_queue):
+    while True:
+        message = await watchdog_queue.get()
+        watchdog_logger.debug(f'[{int(time.time())}] Connection is alive. {message}')
+
+
+
 async def main():
     messages_queue = asyncio.Queue()
     sending_queue = asyncio.Queue()
     status_updates_queue = asyncio.Queue()
     save_messages_queue = asyncio.Queue()
+    watchdog_queue = asyncio.Queue()
     args = parse_args()
 
     await asyncio.gather(
         gui.draw(messages_queue, sending_queue, status_updates_queue),
-        read_msgs(args.host, args.port, messages_queue, save_messages_queue),
+        read_msgs(args.host, args.port, messages_queue, save_messages_queue, status_updates_queue, watchdog_queue),
         save_messages(save_messages_queue, args.filepath),
-        send_msgs(args.host, args.port_write, sending_queue, args.token, args.name),
+        send_msgs(args.host, args.port_write, sending_queue, status_updates_queue, watchdog_queue,args.token, args.name),
+        watch_for_connection(watchdog_queue)
     )
 
 
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO)
+    watchdog_logger.setLevel(logging.DEBUG)
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
