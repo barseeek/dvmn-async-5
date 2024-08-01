@@ -31,10 +31,16 @@ async def get_connection(host, port, attempts=3, timeout=5):
                 await writer.wait_closed()
 
 
-async def read_msg(reader):
+async def read_message(reader):
     message = await reader.readline()
     message = message.decode('utf-8').rstrip()
     logger.debug(f'Received message: {message}')
     return message
 
 
+async def write_message(writer, message=None):
+    if not message:
+        message = '\n'
+    writer.write(message.encode())
+    logger.debug(f'Sent message: {message}')
+    await writer.drain()
