@@ -6,6 +6,7 @@ import time
 from tkinter import messagebox
 
 import aiofiles
+import async_timeout
 from environs import Env
 
 import gui
@@ -15,6 +16,8 @@ from utils import get_connection, read_message, write_message
 logger = logging.getLogger('listener')
 watchdog_logger = logging.getLogger('watchdog')
 
+
+TIMEOUT_SECONDS = 2
 
 async def read_msgs(host, port, message_queue, save_messages_queue, status_updates_queue, watchdog_queue):
     status_updates_queue.put_nowait(gui.ReadConnectionStateChanged.INITIATED)
@@ -100,9 +103,12 @@ async def save_messages(save_messages_queue, filename):
 
 async def watch_for_connection(watchdog_queue):
     while True:
-        message = await watchdog_queue.get()
-        watchdog_logger.debug(f'[{int(time.time())}] Connection is alive. {message}')
-
+        try:
+            async with async_timeout.timeout(TIMEOUT_SECONDS):
+                message = await watchdog_queue.get()
+                watchdog_logger.debug(f'[{int(time.time())}] Connection is alive. {message}')
+        except asyncio.TimeoutError:
+            watchdog_logger.debug(f'[{int(time.time())}] {TIMEOUT_SECONDS}s timeout is elapsed')
 
 
 async def main():
