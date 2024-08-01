@@ -1,6 +1,8 @@
 import argparse
 import asyncio
 import logging
+import sys
+from tkinter import messagebox
 
 import aiofiles
 from environs import Env
@@ -23,12 +25,15 @@ async def read_msgs(host, port, message_queue, save_messages_queue):
             logger.error('Connection Error')
 
 
+class InvalidToken(Exception):
+    pass
+
+
 async def send_msgs(host, port, sending_queue, token, username):
     async with get_connection(host, port) as (reader, writer):
         account = await authorize_user(reader, writer, token, username)
         if not account:
-            logger.info('Неверный токен, зарегистрируйтесь заново')
-            return None
+            raise InvalidToken('Неверный токен')
         else:
             logger.info(f'Пользователь {account.get("nickname")} успешно авторизован')
         while True:
@@ -96,5 +101,10 @@ if __name__ == '__main__':
         asyncio.run(main())
     except KeyboardInterrupt:
         logger.info('Keyboard Interrupt')
-    except Exception:
+    except InvalidToken:
+        messagebox.showinfo("Error", "Неверный токен!")
+        logger.exception('Неверный токен, зарегистрируйтесь заново')
+    except (Exception):
         logger.exception('Unhandled exception')
+    finally:
+        sys.exit(0)
