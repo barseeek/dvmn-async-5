@@ -1,6 +1,5 @@
 import argparse
 import asyncio
-import contextvars
 import logging
 import socket
 import sys
@@ -11,7 +10,7 @@ from tkinter import messagebox
 import aiofiles
 import anyio
 import async_timeout
-from anyio import sleep, run
+from anyio import sleep
 from environs import Env
 
 import gui
@@ -21,8 +20,8 @@ from utils import get_connection, read_message, write_message, InvalidToken
 logger = logging.getLogger('listener')
 watchdog_logger = logging.getLogger('watchdog')
 
-
 TIMEOUT_SECONDS = 10
+PING_DELAY_SECONDS = 4
 
 
 async def read_msgs(host, port, message_queue, save_messages_queue, status_updates_queue, watchdog_queue):
@@ -37,7 +36,6 @@ async def read_msgs(host, port, message_queue, save_messages_queue, status_updat
                 watchdog_queue.put_nowait('New message in chat')
         except ConnectionError:
             logger.error('Connection Error')
-            status_updates_queue.put_nowait(gui.ReadConnectionStateChanged.CLOSED)
         finally:
             status_updates_queue.put_nowait(gui.ReadConnectionStateChanged.CLOSED)
 
@@ -114,28 +112,10 @@ async def watch_for_connection(watchdog_queue):
             raise ConnectionError
 
 
-async def reconnect(func):
-    failed_attempts_to_open_socket = 0
-    while True:
-        if failed_attempts_to_open_socket > 3:
-            time.sleep(10)  # полностью блокируем работу скрипта в ожидании восстановления соединения
-        try:
-            await func()
-        except InvalidToken:
-            sys.stderr.write('Connection with wrong token.\n')
-            break
-        except (ConnectionError, ExceptionGroup, socket.gaierror):
-            sys.stderr.write("Отсутствует подключение к интернету\n")
-            failed_attempts_to_open_socket += 1
-            continue
-        except gui.TkAppClosed:
-            sys.stderr.write("Вы вышли из чата\n")
-            break
-
-
 def prepare_connection(reconnect_function):
     async def inner(async_function):
         await reconnect_function(async_function)
+
     return inner
 
 
@@ -143,8 +123,8 @@ def prepare_connection(reconnect_function):
 async def reconnect_endlessly(async_function):
     failed_attempts_to_open_socket = 0
     while True:
-        if failed_attempts_to_open_socket > 3:
-            time.sleep(10)  # полностью блокируем работу скрипта в ожидании восстановления соединения
+        if failed_attempts_to_open_socket > 0:
+            time.sleep(PING_DELAY_SECONDS)
         try:
             await async_function()
         except InvalidToken:
@@ -159,23 +139,33 @@ async def reconnect_endlessly(async_function):
             break
 
 
+async def ping_server(host, port, watchdog_queue):
+    try:
+        async with get_connection(host, port) as (reader, writer):
+            while True:
+                async with async_timeout.timeout(TIMEOUT_SECONDS):
+                    await write_message(writer, '')
+                    await read_message(reader)
+                    watchdog_queue.put_nowait('Pinged server')
+                    await sleep(PING_DELAY_SECONDS)
+    except asyncio.TimeoutError:
+        watchdog_queue.put_nowait('Connection lost')
+        raise ConnectionError
+
+
 async def handle_connection(
         host, port_listener, port_writer,
         messages_queue, sending_queue, save_messages_queue, status_updates_queue, watchdog_queue,
-        filepath, token, name):
-    try:
-        async with anyio.create_task_group() as tg:
-            tg.start_soon(send_msgs, host, port_writer,
-                          sending_queue, status_updates_queue, watchdog_queue,
-                          token, name)
-            tg.start_soon(watch_for_connection, watchdog_queue)
-            tg.start_soon(read_msgs,
-                          host, port_listener,
-                          messages_queue, save_messages_queue, status_updates_queue, watchdog_queue)
-
-    except ExceptionGroup as exc_group:
-        for exception in exc_group.exceptions:
-            logger.error(exception)
+        token, name):
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(send_msgs, host, port_writer,
+                      sending_queue, status_updates_queue, watchdog_queue,
+                      token, name)
+        tg.start_soon(watch_for_connection, watchdog_queue)
+        tg.start_soon(read_msgs,
+                      host, port_listener,
+                      messages_queue, save_messages_queue, status_updates_queue, watchdog_queue)
+        tg.start_soon(ping_server, host, port_writer, watchdog_queue)
 
 
 async def main():
@@ -185,11 +175,12 @@ async def main():
     save_messages_queue = asyncio.Queue()
     watchdog_queue = asyncio.Queue()
     args = parse_args()
-    conn_function = partial(handle_connection, args.host, args.port, args.port_write, messages_queue, sending_queue, save_messages_queue, status_updates_queue, watchdog_queue, args.filepath, args.token, args.name)
+    conn_function = partial(handle_connection, args.host, args.port, args.port_write,
+                            messages_queue, sending_queue, save_messages_queue, status_updates_queue, watchdog_queue,
+                            args.token, args.name)
     async with anyio.create_task_group() as tg:
         tg.start_soon(reconnect_endlessly, conn_function)
         tg.start_soon(gui.draw, messages_queue, sending_queue, status_updates_queue)
-
 
 
 if __name__ == '__main__':
@@ -199,10 +190,5 @@ if __name__ == '__main__':
         asyncio.run(main())
     except KeyboardInterrupt:
         logger.info('Keyboard Interrupt')
-    except InvalidToken:
-        messagebox.showinfo("Error", "Неверный токен!")
-        logger.exception('Неверный токен, зарегистрируйтесь заново')
-    except (Exception):
-        logger.exception('Unhandled exception')
     finally:
         sys.exit(0)
