@@ -44,3 +44,7 @@ async def write_message(writer, message=None):
     writer.write(message.encode())
     logger.debug(f'Sent message: {message}')
     await writer.drain()
+
+
+class InvalidToken(Exception):
+    pass
