@@ -3,9 +3,11 @@ import asyncio
 import logging
 import sys
 import time
+from dataclasses import dataclass
 from tkinter import messagebox
 
 import aiofiles
+import anyio
 import async_timeout
 from environs import Env
 
@@ -16,31 +18,63 @@ from utils import get_connection, read_message, write_message
 logger = logging.getLogger('listener')
 watchdog_logger = logging.getLogger('watchdog')
 
-
 TIMEOUT_SECONDS = 2
-
-async def read_msgs(host, port, message_queue, save_messages_queue, status_updates_queue, watchdog_queue):
-    status_updates_queue.put_nowait(gui.ReadConnectionStateChanged.INITIATED)
-    async with get_connection(host, port) as (reader, writer):
-        status_updates_queue.put_nowait(gui.ReadConnectionStateChanged.ESTABLISHED)
-        try:
-            while True:
-                message = await read_message(reader)
-                message_queue.put_nowait(message)
-                save_messages_queue.put_nowait(message)
-                watchdog_queue.put_nowait('New message in chat')
-        except ConnectionError:
-            logger.error('Connection Error')
-            status_updates_queue.put_nowait(gui.ReadConnectionStateChanged.CLOSED)
-        finally:
-            status_updates_queue.put_nowait(gui.ReadConnectionStateChanged.CLOSED)
 
 
 class InvalidToken(Exception):
     pass
 
 
-async def send_msgs(host, port, sending_queue, status_updates_queue, watchdog_queue, token, username):
+@dataclass
+class Settings:
+    host: str
+    port: int
+    port_write: int
+    name: str
+    token: str
+    logging: bool
+
+
+@dataclass
+class Queues:
+    messages_queue: asyncio.Queue
+    sending_queue: asyncio.Queue
+    status_updates_queue: asyncio.Queue
+    save_messages_queue: asyncio.Queue
+    watchdog_queue: asyncio.Queue
+
+
+def reconnect(async_function):
+    async def wrapper(settings, queues):
+        attempts = 0
+        while True:
+            if attempts > 0:
+                await asyncio.sleep(TIMEOUT_SECONDS)
+            try:
+                await async_function(settings, queues)
+            except ConnectionError:
+                attempts += 1
+                sys.stderr.write('Connection error, retrying in {} seconds...\n'.format(TIMEOUT_SECONDS))
+
+    return wrapper
+
+
+@reconnect
+async def read_msgs(settings: Settings, queues: Queues):
+    queues.status_updates_queue.put_nowait(gui.ReadConnectionStateChanged.INITIATED)
+    async with get_connection(settings.host, settings.port) as (reader, writer):
+        queues.status_updates_queue.put_nowait(gui.ReadConnectionStateChanged.ESTABLISHED)
+        try:
+            while True:
+                message = await read_message(reader)
+                queues.messages_queue.put_nowait(message)
+                queues.save_messages_queue.put_nowait(message)
+                queues.watchdog_queue.put_nowait('New message in chat')
+        finally:
+            queues.status_updates_queue.put_nowait(gui.ReadConnectionStateChanged.CLOSED)
+
+
+async def send_msgs(host, port, token, username, sending_queue, status_updates_queue, watchdog_queue):
     status_updates_queue.put_nowait(gui.SendingConnectionStateChanged.INITIATED)
     watchdog_queue.put_nowait('Prompt before auth')
     async with get_connection(host, port) as (reader, writer):
@@ -84,8 +118,6 @@ def parse_args():
     parser.add_argument("-t", "--token", type=str,
                         default=env.str('CHAT_TOKEN', ''),
                         help="Set your token")
-    parser.add_argument("-m", "--message", type=str,
-                        help="Set your message")
     parser.add_argument("-l", "--logging", action='store_false')
 
     return parser.parse_args()
@@ -101,32 +133,51 @@ async def save_messages(save_messages_queue, filename):
         save_messages_queue.task_done()
 
 
-async def watch_for_connection(watchdog_queue):
+async def handle_connection(settings: Settings, queues: Queues):
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(send_msgs, settings.host, settings.port_write, settings.token, settings.name,
+                      queues.sending_queue, queues.status_updates_queue, queues.watchdog_queue)
+        tg.start_soon(watch_for_connection, settings, queues)
+        tg.start_soon(read_msgs,settings, queues)
+
+
+@reconnect
+async def watch_for_connection(settings: Settings, queues: Queues):
     while True:
         try:
             async with async_timeout.timeout(TIMEOUT_SECONDS):
-                message = await watchdog_queue.get()
+                message = await queues.watchdog_queue.get()
                 watchdog_logger.debug(f'[{int(time.time())}] Connection is alive. {message}')
         except asyncio.TimeoutError:
             watchdog_logger.debug(f'[{int(time.time())}] {TIMEOUT_SECONDS}s timeout is elapsed')
+            queues.status_updates_queue.put_nowait(gui.ReadConnectionStateChanged.INITIATED)
+            queues.status_updates_queue.put_nowait(gui.SendingConnectionStateChanged.INITIATED)
+            raise ConnectionError
 
 
 async def main():
-    messages_queue = asyncio.Queue()
-    sending_queue = asyncio.Queue()
-    status_updates_queue = asyncio.Queue()
-    save_messages_queue = asyncio.Queue()
-    watchdog_queue = asyncio.Queue()
     args = parse_args()
-
-    await asyncio.gather(
-        gui.draw(messages_queue, sending_queue, status_updates_queue),
-        read_msgs(args.host, args.port, messages_queue, save_messages_queue, status_updates_queue, watchdog_queue),
-        save_messages(save_messages_queue, args.filepath),
-        send_msgs(args.host, args.port_write, sending_queue, status_updates_queue, watchdog_queue,args.token, args.name),
-        watch_for_connection(watchdog_queue)
+    settings = Settings(
+        host=args.host,
+        port=args.port,
+        port_write=args.port_write,
+        name=args.name,
+        token=args.token,
+        logging=args.logging
     )
-
+    queues = Queues(
+        messages_queue=asyncio.Queue(),
+        sending_queue=asyncio.Queue(),
+        status_updates_queue=asyncio.Queue(),
+        save_messages_queue=asyncio.Queue(),
+        watchdog_queue=asyncio.Queue(),
+    )
+    try:
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(gui.draw, queues)
+            tg.start_soon(handle_connection, settings, queues)
+    except Exception as e:
+        print(e)
 
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO)
