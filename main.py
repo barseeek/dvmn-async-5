@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import logging
+import socket
 import sys
 import time
 from dataclasses import dataclass
@@ -18,7 +19,7 @@ from utils import get_connection, read_message, write_message
 logger = logging.getLogger('listener')
 watchdog_logger = logging.getLogger('watchdog')
 
-TIMEOUT_SECONDS = 2
+TIMEOUT_SECONDS = 5
 
 
 class InvalidToken(Exception):
@@ -46,54 +47,56 @@ class Queues:
 
 def reconnect(async_function):
     async def wrapper(settings, queues):
-        attempts = 0
         while True:
-            if attempts > 0:
-                await asyncio.sleep(TIMEOUT_SECONDS)
             try:
                 await async_function(settings, queues)
-            except ConnectionError:
-                attempts += 1
-                sys.stderr.write('Connection error, retrying in {} seconds...\n'.format(TIMEOUT_SECONDS))
-
+            except (ConnectionError, socket.gaierror):
+                continue
+            except InvalidToken:
+                sys.stderr.write('Connection with wrong token.\n')
+                messagebox.showinfo('Wrong token', 'Connection with wrong token.\n')
+                break
     return wrapper
 
 
 @reconnect
 async def read_msgs(settings: Settings, queues: Queues):
-    queues.status_updates_queue.put_nowait(gui.ReadConnectionStateChanged.INITIATED)
-    async with get_connection(settings.host, settings.port) as (reader, writer):
-        queues.status_updates_queue.put_nowait(gui.ReadConnectionStateChanged.ESTABLISHED)
-        try:
+    try:
+        queues.status_updates_queue.put_nowait(gui.ReadConnectionStateChanged.INITIATED)
+        async with get_connection(settings.host, settings.port) as (reader, writer):
+            queues.status_updates_queue.put_nowait(gui.ReadConnectionStateChanged.ESTABLISHED)
             while True:
                 message = await read_message(reader)
                 queues.messages_queue.put_nowait(message)
                 queues.save_messages_queue.put_nowait(message)
                 queues.watchdog_queue.put_nowait('New message in chat')
-        finally:
-            queues.status_updates_queue.put_nowait(gui.ReadConnectionStateChanged.CLOSED)
+    except ConnectionError:
+        queues.status_updates_queue.put_nowait(gui.ReadConnectionStateChanged.INITIATED)
 
 
-async def send_msgs(host, port, token, username, sending_queue, status_updates_queue, watchdog_queue):
-    status_updates_queue.put_nowait(gui.SendingConnectionStateChanged.INITIATED)
-    watchdog_queue.put_nowait('Prompt before auth')
-    async with get_connection(host, port) as (reader, writer):
-        account = await authorize_user(reader, writer, token, username)
-        if not account:
-            status_updates_queue.put_nowait(gui.SendingConnectionStateChanged.CLOSED)
-            watchdog_queue.put_nowait('Auth failed')
-            raise InvalidToken('Неверный токен')
-        else:
-            nickname = account.get('nickname')
-            logger.info(f'Пользователь {nickname} успешно авторизован')
-            watchdog_queue.put_nowait('Auth success')
-            status_updates_queue.put_nowait(gui.SendingConnectionStateChanged.ESTABLISHED)
-            status_updates_queue.put_nowait(gui.NicknameReceived(nickname))
+@reconnect
+async def send_msgs(settings: Settings, queues: Queues):
+    try:
+        queues.status_updates_queue.put_nowait(gui.SendingConnectionStateChanged.INITIATED)
+        async with get_connection(settings.host, settings.port_write) as (reader, writer):
+            account = await authorize_user(reader, writer, settings.token, settings.name)
+            if not account:
+                queues.status_updates_queue.put_nowait(gui.SendingConnectionStateChanged.CLOSED)
+                queues.watchdog_queue.put_nowait('Auth failed')
+                raise InvalidToken('Неверный токен')
+            else:
+                nickname = account.get('nickname')
+                logger.info(f'Пользователь {nickname} успешно авторизован')
+                queues.watchdog_queue.put_nowait('Auth success')
+                queues.status_updates_queue.put_nowait(gui.SendingConnectionStateChanged.ESTABLISHED)
+                queues.status_updates_queue.put_nowait(gui.NicknameReceived(nickname))
 
-        while True:
-            message = await sending_queue.get()
-            await write_message(writer, f'{message}\n\n')
-            watchdog_queue.put_nowait('Sent message')
+            while True:
+                message = await queues.sending_queue.get()
+                await write_message(writer, f'{message}\n\n')
+                queues.watchdog_queue.put_nowait('Sent message')
+    except ConnectionError:
+        queues.status_updates_queue.put_nowait(gui.SendingConnectionStateChanged.INITIATED)
 
 
 def parse_args():
@@ -135,10 +138,9 @@ async def save_messages(save_messages_queue, filename):
 
 async def handle_connection(settings: Settings, queues: Queues):
     async with anyio.create_task_group() as tg:
-        tg.start_soon(send_msgs, settings.host, settings.port_write, settings.token, settings.name,
-                      queues.sending_queue, queues.status_updates_queue, queues.watchdog_queue)
+        tg.start_soon(send_msgs, settings, queues)
         tg.start_soon(watch_for_connection, settings, queues)
-        tg.start_soon(read_msgs,settings, queues)
+        tg.start_soon(read_msgs, settings, queues)
 
 
 @reconnect
@@ -150,8 +152,6 @@ async def watch_for_connection(settings: Settings, queues: Queues):
                 watchdog_logger.debug(f'[{int(time.time())}] Connection is alive. {message}')
         except asyncio.TimeoutError:
             watchdog_logger.debug(f'[{int(time.time())}] {TIMEOUT_SECONDS}s timeout is elapsed')
-            queues.status_updates_queue.put_nowait(gui.ReadConnectionStateChanged.INITIATED)
-            queues.status_updates_queue.put_nowait(gui.SendingConnectionStateChanged.INITIATED)
             raise ConnectionError
 
 
@@ -176,20 +176,22 @@ async def main():
         async with anyio.create_task_group() as tg:
             tg.start_soon(gui.draw, queues)
             tg.start_soon(handle_connection, settings, queues)
-    except Exception as e:
-        print(e)
+    except ExceptionGroup as exception_group:
+        for exception in exception_group.exceptions:
+            if isinstance(exception, gui.TkAppClosed):
+                sys.stderr.write('Application is closed.\n')
+    finally:
+        queues.status_updates_queue.put_nowait(gui.SendingConnectionStateChanged.CLOSED)
+        queues.status_updates_queue.put_nowait(gui.ReadConnectionStateChanged.CLOSED)
+
 
 if __name__ == '__main__':
+
     logging.basicConfig(level=logging.INFO)
     watchdog_logger.setLevel(logging.DEBUG)
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
         logger.info('Keyboard Interrupt')
-    except InvalidToken:
-        messagebox.showinfo("Error", "Неверный токен!")
-        logger.exception('Неверный токен, зарегистрируйтесь заново')
-    except (Exception):
-        logger.exception('Unhandled exception')
     finally:
         sys.exit(0)
