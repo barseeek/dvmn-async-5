@@ -56,6 +56,7 @@ def reconnect(async_function):
                 sys.stderr.write('Connection with wrong token.\n')
                 messagebox.showinfo('Wrong token', 'Connection with wrong token.\n')
                 break
+
     return wrapper
 
 
@@ -83,10 +84,10 @@ async def send_msgs(settings: Settings, queues: Queues):
             if not account:
                 queues.status_updates_queue.put_nowait(gui.SendingConnectionStateChanged.CLOSED)
                 queues.watchdog_queue.put_nowait('Auth failed')
-                raise InvalidToken('Неверный токен')
+                raise InvalidToken('Wrong token')
             else:
                 nickname = account.get('nickname')
-                logger.info(f'Пользователь {nickname} успешно авторизован')
+                logger.info(f'User {nickname} successfully authenticated')
                 queues.watchdog_queue.put_nowait('Auth success')
                 queues.status_updates_queue.put_nowait(gui.SendingConnectionStateChanged.ESTABLISHED)
                 queues.status_updates_queue.put_nowait(gui.NicknameReceived(nickname))
@@ -141,6 +142,20 @@ async def handle_connection(settings: Settings, queues: Queues):
         tg.start_soon(send_msgs, settings, queues)
         tg.start_soon(watch_for_connection, settings, queues)
         tg.start_soon(read_msgs, settings, queues)
+        tg.start_soon(ping_server, settings, queues)
+
+
+@reconnect
+async def ping_server(settings: Settings, queues: Queues):
+    async with get_connection(settings.host, settings.port) as (reader, writer):
+        try:
+            async with async_timeout.timeout(TIMEOUT_SECONDS) as tm:
+                await write_message(writer, '')
+                await read_message(reader)
+                queues.watchdog_queue.put_nowait('Pinged server')
+            await asyncio.sleep(TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            pass
 
 
 @reconnect

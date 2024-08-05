@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import socket
 from contextlib import asynccontextmanager
 
 
@@ -15,11 +16,10 @@ async def get_connection(host, port, attempts=3, timeout=5):
         try:
             reader, writer = await asyncio.open_connection(
                 host, port)
-            logger.info('Connection established\n')
             yield reader, writer
-        except ConnectionError:
+        except (ConnectionError, socket.gaierror):
             if attempts_count < attempts:
-                logger.warning('Connection Error, try again\n')
+                logger.warning('Connection Error, try again')
                 attempts_count += 1
                 continue
             else:
