@@ -2,9 +2,34 @@ import asyncio
 import logging
 import socket
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 
+import aiofiles
 
 logger = logging.getLogger(__name__)
+
+
+class InvalidToken(Exception):
+    pass
+
+
+@dataclass
+class Settings:
+    host: str
+    port: int
+    port_write: int
+    name: str
+    token: str
+    logging: bool
+
+
+@dataclass
+class Queues:
+    messages_queue: asyncio.Queue
+    sending_queue: asyncio.Queue
+    status_updates_queue: asyncio.Queue
+    save_messages_queue: asyncio.Queue
+    watchdog_queue: asyncio.Queue
 
 
 @asynccontextmanager
@@ -44,3 +69,13 @@ async def write_message(writer, message=None):
     writer.write(message.encode())
     logger.debug(f'Sent message: {message}')
     await writer.drain()
+
+
+async def get_token(filepath):
+    try:
+        async with aiofiles.open(filepath, 'r') as afp:
+            token = await afp.read()
+            return token
+    except FileNotFoundError as err:
+        logger.exception(f'{err.strerror}: {err.filename}', exc_info=False)
+        raise InvalidToken('Файл не найден', 'Файл с токеном не найден.')

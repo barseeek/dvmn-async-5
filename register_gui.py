@@ -37,27 +37,24 @@ async def draw(queue):
 
 async def save_account(account_payload, filepath):
     async with aiofiles.open(filepath, 'w') as file:
-        await file.write(str(account_payload))
+        await file.write(str(account_payload.get('account_hash')))
 
 
 async def register_user(host, port, queue, filepath):
     username = await queue.get()
-    print(f'Username: {username}')
     async with get_connection(host, port) as (reader, writer):
         if not username:
             messagebox.showinfo('Error', 'Введите имя')
             raise TkAppClosed()
-        message = await read_message(reader)
-        message = await write_message(writer)
-        message = await read_message(reader)
-        message = await write_message(writer, f'{username}\n')
-        print(message)
+        await read_message(reader)
+        await write_message(writer)
+        await read_message(reader)
+        await write_message(writer, f'{username}\n')
         account_payload = await read_message(reader)
-        print(account_payload)
         try:
             account_data = json.loads(account_payload)
             await save_account(account_data, filepath)
-            messagebox.showinfo('Success', 'Registration successful')
+            messagebox.showinfo('Success', 'Registration successful, {}!'.format(account_data.get('nickname')))
         except JSONDecodeError:
             messagebox.showinfo('Error', 'Registration failed')
         finally:
@@ -74,8 +71,8 @@ def parse_args():
     parser.add_argument("-pw", "--port_write", type=int,
                         default=env.int('PORT_WRITER', 5050),
                         help="Set the port number on which you want to write messages")
-    parser.add_argument("-f", "--filepath", type=str,
-                        default=env.str('FILE_PATH', 'access_token.txt'),
+    parser.add_argument("-tf", "--token_file", type=str,
+                        default=env.str('CHAT_TOKEN_FILE', 'access_token.txt'),
                         help="Set path to the file where the account data will be written to")
     return parser.parse_args()
 
@@ -86,7 +83,7 @@ async def main():
     try:
         async with create_task_group() as tg:
             tg.start_soon(draw, queue)
-            tg.start_soon(register_user, args.host, args.port_write, queue, args.filepath)
+            tg.start_soon(register_user, args.host, args.port_write, queue, args.token_file)
     except ExceptionGroup as exception_group:
         for exception in exception_group.exceptions:
             if isinstance(exception, TkAppClosed):

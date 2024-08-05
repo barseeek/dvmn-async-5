@@ -4,7 +4,6 @@ import logging
 import socket
 import sys
 import time
-from dataclasses import dataclass
 from tkinter import messagebox
 
 import aiofiles
@@ -14,35 +13,12 @@ from environs import Env
 
 import gui
 from authorization import authorize_user
-from utils import get_connection, read_message, write_message
+from utils import get_connection, read_message, write_message, InvalidToken, Settings, Queues, get_token
 
 logger = logging.getLogger('listener')
 watchdog_logger = logging.getLogger('watchdog')
 
 TIMEOUT_SECONDS = 5
-
-
-class InvalidToken(Exception):
-    pass
-
-
-@dataclass
-class Settings:
-    host: str
-    port: int
-    port_write: int
-    name: str
-    token: str
-    logging: bool
-
-
-@dataclass
-class Queues:
-    messages_queue: asyncio.Queue
-    sending_queue: asyncio.Queue
-    status_updates_queue: asyncio.Queue
-    save_messages_queue: asyncio.Queue
-    watchdog_queue: asyncio.Queue
 
 
 def reconnect(async_function):
@@ -122,6 +98,9 @@ def parse_args():
     parser.add_argument("-t", "--token", type=str,
                         default=env.str('CHAT_TOKEN', ''),
                         help="Set your token")
+    parser.add_argument("-tf", "--token_file", type=str,
+                        default=env.str('CHAT_TOKEN_FILE', 'access_token.txt'),
+                        help="Set your token file path")
     parser.add_argument("-l", "--logging", action='store_false')
 
     return parser.parse_args()
@@ -172,12 +151,15 @@ async def watch_for_connection(settings: Settings, queues: Queues):
 
 async def main():
     args = parse_args()
+    token = args.token
+    if token == '':
+        token = await get_token(args.token_file)
     settings = Settings(
         host=args.host,
         port=args.port,
         port_write=args.port_write,
         name=args.name,
-        token=args.token,
+        token=token,
         logging=args.logging
     )
     queues = Queues(
@@ -208,5 +190,8 @@ if __name__ == '__main__':
         asyncio.run(main())
     except KeyboardInterrupt:
         logger.info('Keyboard Interrupt')
+    except InvalidToken:
+        sys.stderr.write('Connection with wrong token.\n')
+        messagebox.showinfo('Wrong token', 'Connection with wrong token.\n')
     finally:
         sys.exit(0)
